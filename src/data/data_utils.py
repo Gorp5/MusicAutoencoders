@@ -75,11 +75,6 @@ class StreamViewDataset(Dataset):
         return track_id, torch.stack(views), torch.stack(masks)
 
 class MemmapDataset:
-    """
-    Dataset for sharded memmap spectrogram storage.
-    Works with unified index.npy + .bin shard files.
-    """
-
     def __init__(
         self,
         memmap_root,
@@ -100,20 +95,12 @@ class MemmapDataset:
         self.dtype = dtype
         self.freq_bins = freq_bins
 
-        # ---------------------------
-        # Load FULL index, then filter
-        # ---------------------------
         index_path = os.path.join(memmap_root, "index.npy")
         full_index = np.load(index_path)
 
-        # FILTER BY SPLIT (CRITICAL)
         self.index = full_index[full_index["split"] == split]
 
         self.track_ids = self.index["track_id"]
-
-        # ---------------------------
-        # Lazy memmap cache
-        # ---------------------------
         self.memmaps = {}
 
     def __len__(self):
@@ -145,17 +132,11 @@ class MemmapDataset:
         start = int(row["start"])
         length = int(row["length"])
 
-        # ---------------------------
-        # Load slice (ZERO COPY)
-        # ---------------------------
         mm = self._get_memmap(file_id)
-        spec = mm[start:start + length]  # (time, freq)
+        spec = mm[start:start + length]
 
         spec = torch.from_numpy(spec.copy()).float().T
 
-        # ---------------------------
-        # Generate views
-        # ---------------------------
         views, masks = [], []
 
         for _ in range(self.view_count):

@@ -64,9 +64,8 @@ class Rotary2D(nn.Module):
     def _axis_cos_sin(self, coords_axis, axis_name):
         exp = getattr(self, f"rope_exp_{axis_name}")
         log_base = math.log(self.rope_base)
-        inv_freq = torch.exp(-exp * log_base)  # [half_dim]
+        inv_freq = torch.exp(-exp * log_base)
 
-        # coords_axis: [..., axis_size, 1] * [half_dim] -> [..., axis_size, half_dim]
         freqs = coords_axis.unsqueeze(-1) * inv_freq
         cos = freqs.cos()
         sin = freqs.sin()
@@ -83,7 +82,7 @@ class Rotary2D(nn.Module):
         right = tensor[..., axis_slice.stop:]
 
         # Move the rotation axis to last dim for broadcasting
-        mid_perm = mid.transpose(axis_dim, -2)  # [..., axis_size, F_slice]
+        mid_perm = mid.transpose(axis_dim, -2)
         rotated = self.apply_rotary(mid_perm, cos, sin)
         rotated = rotated.transpose(axis_dim, -2)
         return torch.cat([left, rotated, right], dim=-1)
@@ -94,18 +93,15 @@ class Rotary2D(nn.Module):
 
         B, H, N, D = q.shape
 
-        # coords: [B, H_img, W_img, 2] → [B, N, 2]
         coords = coords.view(B, N, 2)
-
-        # expand for heads
-        coords = coords.unsqueeze(1)  # [B, 1, N, 2]
+        coords = coords.unsqueeze(1)
 
         q_out, k_out = q, k
 
         for axis_name, axis_slice in self.axis_slices:
             axis_index = 0 if axis_name == "x" else 1
 
-            axis_coords = coords[..., axis_index]  # [B, 1, N]
+            axis_coords = coords[..., axis_index]
 
             cos, sin = self._axis_cos_sin(axis_coords, axis_name)
 
@@ -423,10 +419,6 @@ class Myna(nn.Module):
 
         self.patch_coordinates = self.get_patch_coordinates(image_height, image_width, device)
 
-        # self.transformer = Transformer(d_model, depth, heads, dim_head, mlp_dim, clamping=clamping,
-        #                                rope_on_x=use_rope_x, rope_on_y=use_rope_y, alibi_on_x=use_alibi_x, alibi_on_y=use_alibi_y,
-        #                                rope_base=rope_base, predict_tempo=predict_tempo)
-
         self.transformer = Transformer(d_model, depth, heads, dim_head, mlp_dim, clamping=clamping,
                                        use_rope_x=self.use_rope_x,
                                        use_rope_y=self.use_rope_y,
@@ -534,7 +526,6 @@ class Myna(nn.Module):
         )
 
         return patch_mask
-
 
     def get_patch_coordinates(self, H, W, device=None):
         num_h = H // self.patch_height

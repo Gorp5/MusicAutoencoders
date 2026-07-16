@@ -4,26 +4,15 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from google.cloud import storage
 from torch import optim
 
 from models.Myna import Myna
 from data.data_utils import MemmapDataset
 from info_nce import InfoNCE
-import subprocess
-import sys
 
-
-# ---------------------------
-# SPEED FIX: multiprocessing safety
-# ---------------------------
 mp.set_start_method("spawn", force=True)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-
-# ---------------------------
-# Model
-# ---------------------------
 def build_model(mask_ratio, chunk_length, embedding_params, device):
     if os.path.exists("/mnt/ssd/output/GPU-0/model_0.pt"):
         return torch.load("/mnt/ssd/output/GPU-0/model_0.pt")["model"]
@@ -54,9 +43,6 @@ def build_model(mask_ratio, chunk_length, embedding_params, device):
         )
 
 
-# ---------------------------
-# DataLoader (FAST + SAFE)
-# ---------------------------
 def build_dataloader(dataset_path, batch_size, chunk_length):
     dataset = MemmapDataset(dataset_path, split="train", views=2, chunk_size=chunk_length)
 
@@ -64,51 +50,43 @@ def build_dataloader(dataset_path, batch_size, chunk_length):
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=3,
-        pin_memory=True,
-        drop_last=True,
+        num_workers=1,
         persistent_workers=True,
         prefetch_factor=1
     )
 
 
-# ---------------------------
-# GPU WORKER
-# ---------------------------
-def gpu_worker(gpu_id, args, model_params_list):
-    print(f"[GPU {gpu_id}] worker starting")
+def gpu_worker(args, params):
+    print(f"Training Starting starting")
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = torch.device("cuda:0")
-
-    # torch.cuda.set_device(device)
+    device = torch.device("cuda")
 
     models, optimizers = [], []
 
-    for params in model_params_list[gpu_id]:
-        model = build_model(
-            params["mask_ratio"],
-            params["chunk_length"],
-            params["embedding_params"],
-            device
-        ).to(device)
+    model = build_model(
+        params["mask_ratio"],
+        params["chunk_length"],
+        params["embedding_params"],
+        device
+    ).to(device)
 
-        model.train()
+    model.train()
 
-        epochs_done = 0
-        if os.path.exists("/mnt/ssd/output/GPU-0/model_0.pt"):
-            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            saved = torch.load("/mnt/ssd/output/GPU-0/model_0.pt")
-            optimizer = optimizer.load_state_dict(saved["optimizer_state_dict"])
-            optimizers.append(optimizer)
+    epochs_done = 0
+    save_dir = os.path.join(args.save_dir, f"output")
+    save_file = os.path.join(save_dir, f"model.pt")
 
-            epochs_done = saved["epoch"]
-        else:
-            optimizers.append(
-                optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            )
+    if os.path.exists(save_file):
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        saved = torch.load(save_file)
 
-        models.append(model)
+        optimizer.load_state_dict(saved["optimizer_state_dict"])
+        epochs_done = saved["epoch"]
+        total_losses = saved["loss"]
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+        total_losses = []
 
     criterion = InfoNCE()
 
@@ -118,16 +96,14 @@ def gpu_worker(gpu_id, args, model_params_list):
         args.chunk_length
     )
 
-    save_dir = os.path.join(args.save_dir, f"GPU-{gpu_id}")
+
     os.makedirs(save_dir, exist_ok=True)
 
-    # ---------------------------
-    # TRAIN LOOP
-    # ---------------------------
-    total_losses = []
+    i = 0
 
-    for epoch in range(args.epochs - epochs_done):
-        losses = [0.0 for _ in models]
+    # Training
+    for epoch in range(epochs_done, args.epochs):
+        losses = 0.0
 
         pbar = tqdm(dataloader, desc=f"GPU {gpu_id} Epoch {epoch}")
 
@@ -135,44 +111,35 @@ def gpu_worker(gpu_id, args, model_params_list):
             _, inputs, _ = batch
             inputs = inputs.to(device, non_blocking=True)
 
-            for i, (model, params, optimizer) in enumerate(zip(models, model_params_list[gpu_id], optimizers)):
-                chunk_len = params["chunk_length"]
+            chunk_len = params["chunk_length"]
+            sliced = inputs[:, :, :, :chunk_len]
+            B, _, T, F = sliced.shape
 
-                sliced = inputs[:, :, :, :chunk_len]  # [B, 2, chunk_len, F]
-                B, _, T, F = sliced.shape
+            # Flatten views
+            stacked = sliced.view(B * 2, T, F).unsqueeze(1)
 
-                # Flatten views
-                stacked = sliced.view(B * 2, T, F).unsqueeze(1)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                z = model(stacked, mask=None, checkpointing=False).squeeze(1).view(B, 2, -1)
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    z = model(stacked, mask=None, checkpointing=True).squeeze(1).view(B, 2, -1)
+            optimizer.zero_grad()
 
-                optimizer.zero_grad(set_to_none=True)
+            loss = criterion(z[:, 0], z[:, 1])
+            loss.backward()
+            optimizer.step()
 
-                loss = criterion(z[:, 0], z[:, 1])
-                loss.backward()
-                optimizer.step()
+            losses += loss.item()
 
-                losses[i] += loss.item()
-
-        # ---------------------------
-        # SAVE
-        # ---------------------------
-
+        # Saving
         final_epoch_loss = losses[i] / len(dataloader)
         total_losses.append(final_epoch_loss)
 
-        for i, model in enumerate(models):
-            torch.save({
-                "epoch": epoch,
-                "model": model,
-                "optimizer_state_dict": optimizers[i].state_dict(),
-                "loss": total_losses
-            }, os.path.join(save_dir, f"model_{i}.pt"))
+        torch.save({
+            "epoch": epoch,
+            "model": model,
+            "optimizer_state_dict": optimizers[i].state_dict(),
+            "loss": total_losses
+        }, os.path.join(save_dir, f"model_{i}.pt"))
 
-# ---------------------------
-# CONFIG
-# ---------------------------
 def determine_based_on_id(id):
     masking_ratio_array = [0.25, 0.5, 0.75, 0.9]
     training_chunk_length_array = [128, 256, 512, 1024, 2048]
@@ -190,7 +157,7 @@ def determine_based_on_id(id):
         dict(name="rope_double_frequency", rope_x=True, rope_y=True),
     ]
 
-    config = embedding_configs[id % len(embedding_configs)]
+    config = embedding_configs[id // 20]
 
     return (
         masking_ratio_array[id % len(masking_ratio_array)],
@@ -198,10 +165,6 @@ def determine_based_on_id(id):
         config
     )
 
-
-# ---------------------------
-# MAIN
-# ---------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -223,27 +186,15 @@ if __name__ == "__main__":
 
     models_per_gpu = [[] for _ in range(args.num_gpus)]
 
-    for i in range(args.num_models):
-        i = i + args.id
-        gpu_id = i % args.num_gpus
+    i = args.id
+    gpu_id = i % args.num_gpus
 
-        mask_ratio, chunk_length, params = determine_based_on_id(i)
+    mask_ratio, chunk_length, params = determine_based_on_id(i)
 
-        models_per_gpu[gpu_id].append({
-            "mask_ratio": mask_ratio,
-            "chunk_length": chunk_length,
-            "embedding_params": params
-        })
+    config = {
+        "mask_ratio": mask_ratio,
+        "chunk_length": chunk_length,
+        "embedding_params": params
+    }
 
-    processes = []
-
-    for gpu_id in range(args.num_gpus):
-        p = mp.Process(
-            target=gpu_worker,
-            args=(gpu_id, args, models_per_gpu)
-        )
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
+    gpu_worker(args, config)

@@ -9,16 +9,6 @@ from utils.Config import Config
 masking_ratios = [0.25, 0.5, 0.75, 0.9]
 training_chunk_lengths = [128, 256, 512, 1024, 2048]
 embedding_strategy = ["alibi_2d_learned", "alibi_1d", "alibi_2d", "rope_1d", "rope_2d", "sinusoidal_raster", "learned_x", "none", "sinusoidal_xy", "rope_double_frequency"]
-# alibi_x             = [True,  True,  True,  False, False, False, False, False, False, False]
-# alibi_y             = [True,  False, True,  False, False, False, False, False, False, False]
-# alibi_learned_slopes= [True,  False, False, False, False, False, False, False, False, False]
-# rope_x              = [False, False, False, True,  True,  False, False, False, False, True]
-# rope_y              = [False, False, False, False, True,  False, False, False, False, True]
-# sinusoidal_raster   = [False, False, False, False, False, True,  False, False, False, False]
-# sinusoidal_x        = [False, False, False, False, False, False, False, False, True,  False]
-# sinusoidal_y        = [False, False, False, False, False, False, False, False, True,  False]
-# learned_x           = [False, False, False, False, False, False, True,  False, False, False]
-# learned_y           = [False, True,  False, True,  False, False, True,  False, False, False]
 
 BASE_CONFIG = dict(
     alibi_x=False,
@@ -76,26 +66,18 @@ def train_contrastive(model, test_dataloader, train_dataloader, config, start_ep
     for epoch in range(start_epoch, config.num_epochs):
         batch_steps = 0
         epoch_same_song_contrastive_loss = 0
-        epoch_convex_loss = 0
 
         batches = len(train_dataloader)
         pbar = tqdm(train_dataloader)
         for batch in pbar:
             indicies, inputs, masks = batch
 
-            # move inputs to device
             B, _, T, F = inputs.shape
 
             inputs = inputs.to(device=device)
-            # masks = masks.to(device=device, dtype=torch.bool)
-
-            # stack views locally
-            # stacked = torch.cat(inputs, dim=0)  # [num_views * B, ...]
-            # stacked_masks = torch.cat(masks, dim=0)
 
             # forward pass
             stacked = inputs.view(B * 2, T, F).unsqueeze(1)
-            # masks = masks.view(B * 2, T, F).unsqueeze(1)
 
             stacked = model(stacked, mask=None)
             z_list = stacked.squeeze(1).view(B, 2, -1)
@@ -146,14 +128,12 @@ def evaluate_contrastive(model, dataloader, config):
         for batch in tqdm(dataloader):
             indicies, inputs, masks = batch
 
-            # move inputs to device
             B, _, T, F = inputs.shape
 
             inputs = inputs.to(device=config.device)
 
             # forward pass
             stacked = inputs.view(B * 2, T, F).unsqueeze(1)
-            # masks = masks.view(B * 2, T, F).unsqueeze(1)
 
             stacked = model(stacked, mask=None)
             z_list = stacked.squeeze(1).view(B, 2, -1)
